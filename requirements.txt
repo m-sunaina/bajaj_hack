@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+langchain
+langchain-community
+pymupdf
+faiss-cpu
+sentence-transformers
+python-multipart
+qdrant-client
+requests
+google-generativeai
+streamlit
