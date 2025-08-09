@@ -1,143 +1,108 @@
-# main.py - Streamlit + FastAPI Backend for Insurance Assistant
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from utils.loader import load_and_chunk
-from utils.embedder import store_chunks_qdrant, load_qdrant  # Qdrant methods
-from utils.llm_reasoner import get_decision
-import os, shutil, json, re
-import google.generativeai as genai
-from typing import Dict, Any
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.openapi.utils import get_openapi
+from fastapi.routing import APIRouter
+from pydantic import BaseModel
+from typing import List
+import os
+import requests
 import tempfile
-from fastapi import Form
-import urllib.parse
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+import google.generativeai as genai
+from utils.loader import load_and_chunk
+from utils.embedder import store_chunks_qdrant, load_qdrant
 
-
+# Load env variables
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("API_KEY")
+
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-# --- FastAPI App ---
 app = FastAPI()
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+router = APIRouter(prefix="/api/v1")
 
-# -------------------------
-# Query Parsing with Gemini
-# -------------------------
-def parse_query(query: str) -> Dict[str, Any]:
+api_key_header = APIKeyHeader(name="Authorization")
+
+class HackRxRequest(BaseModel):
+    documents: str
+    questions: List[str]
+
+@router.post("/hackrx/run")
+async def hackrx_run(payload: HackRxRequest, authorization: str = Security(api_key_header)):
+    if not authorization or not authorization.startswith("Bearer ") or authorization[7:] != API_KEY:
+        raise HTTPException(401, "Invalid or missing API key")
+
     try:
-        prompt = f"""
-        Extract the following fields from the query below:
-        age, gender, procedure, location, policy_duration.
-        Respond in JSON only.
+        resp = requests.get(payload.documents, timeout=30)
+        resp.raise_for_status()
 
-        Query: {query}
-        """
-        response = model.generate_content(prompt)
-        json_str = response.text.strip()
+        url_path = urlparse(payload.documents).path
+        suffix = os.path.splitext(url_path)[1] or ".pdf"
 
-        # Extract JSON if wrapped in ```json``` fences
-        if '```json' in json_str:
-            json_str = re.search(r"```json\s*(.*?)\s*```", json_str, re.DOTALL).group(1)
-
-        return json.loads(json_str)
-    except Exception as e:
-        return {"raw_query": query, "error": str(e)}
-
-# -------------------------
-# Upload Endpoint
-# -------------------------
-@app.post("/upload")
-async def upload_doc(file: UploadFile = File(...)):
-    try:
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        chunks = load_and_chunk(file_path)
-        store_chunks_qdrant(chunks)  # Store in Qdrant
-
-        return {"message": "Uploaded and processed successfully", "chunks": len(chunks)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -------------------------
-# Query Endpoint
-# -------------------------
-@app.post("/query")
-async def query_decision(query: str):
-    parsed = parse_query(query)
-    decision = get_decision(query)
-    return {"parsed_query": parsed, "decision_result": decision}
-
-
-
-@app.post("/bulk_query")
-async def bulk_query(
-    file: UploadFile = File(None),
-    document_url: str = Form(None),
-    questions: str = Form(...)
-):
-    try:
-        # Save uploaded file or download from URL
-        if file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-                shutil.copyfileobj(file.file, tmp)
-                tmp_path = tmp.name
-        elif document_url:
-            response = requests.get(document_url)
-            if response.status_code != 200:
-                raise HTTPException(status_code=400, detail="Failed to download document from URL")
-
-            parsed_url = urllib.parse.urlparse(document_url)
-            ext = os.path.splitext(parsed_url.path)[1] or ".pdf"
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                tmp.write(response.content)
-                tmp_path = tmp.name
-        else:
-            raise HTTPException(status_code=400, detail="No file or document URL provided")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(resp.content)
+            tmp_path = tmp.name
 
         chunks = load_and_chunk(tmp_path)
         store_chunks_qdrant(chunks)
         db = load_qdrant()
 
-        questions_list = json.loads(questions) if questions.strip().startswith("[") else [questions]
         answers = []
-
-        for question in questions_list:
+        for question in payload.questions:
             docs = db.similarity_search(question, k=4)
-
-            def safe_metadata(md):
-                safe_md = {}
-                for k, v in md.items():
-                    try:
-                        json.dumps(v)
-                        safe_md[k] = v
-                    except Exception:
-                        safe_md[k] = str(v)
-                return safe_md
-
-            context = "\n\n".join([
-                f"Document: {safe_metadata(d.metadata).get('source', 'unknown')} | Page: {safe_metadata(d.metadata).get('page', '-')}\nClause: {d.page_content}"
-                for d in docs
-            ])
-
+            context = "\n\n".join([f"Document Clause: {d.page_content}" for d in docs])
             prompt = (
-                f"Answer the question using the given clauses.\n\n"
-                f"Question: {question}\n\n"
-                f"Clauses:\n{context}\n\n"
-                "Answer in one short sentence."
+                f"Answer this insurance policy question accurately and concisely:\n"
+                f"Question: {question}\n"
+                f"Relevant Policy Clauses:\n{context}\n"
+                "Answer in one clear sentence under 30 words."
             )
-            answer = model.generate_content(prompt).text.strip()
-            answers.append(answer)
+            try:
+                answer = model.generate_content(prompt).text.strip()
+                answers.append(answer)
+            except Exception as e:
+                answers.append(f"Error generating answer: {str(e)}")
 
         return {"answers": answers}
 
+    except requests.RequestException as e:
+        raise HTTPException(400, f"Failed to download document: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, f"Processing error: {str(e)}")
+    finally:
+        try:
+            if 'tmp_path' in locals():
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
+app.include_router(router)
 
+# Add global security scheme to OpenAPI for Swagger UI "Authorize" button
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="HackRx API",
+        version="1.0.0",
+        description="API with Bearer authentication",
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+        }
+    }
+    for path in openapi_schema["paths"].values():
+        for method in path.values():
+            method["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
