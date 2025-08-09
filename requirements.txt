@@ -12,8 +12,4 @@ qdrant-client==1.14.2
 python-docx==0.8.11
 pypdf==5.9.0
 PyMuPDF==1.26.3
-sentence-transformers==2.2.2
-torch
-transformers
-
-
+sentence-transformers==5.0.0
