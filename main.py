@@ -1,3 +1,9 @@
+import warnings
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+
+import logging
+logging.basicConfig(level=logging.INFO)
+
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.openapi.utils import get_openapi
@@ -5,10 +11,10 @@ from fastapi.routing import APIRouter
 from pydantic import BaseModel
 from typing import List
 import os
-import requests
 import tempfile
 from urllib.parse import urlparse
 import asyncio
+import httpx  # for async HTTP requests
 
 # Local .env only for local dev
 if os.getenv("RENDER") != "true":
@@ -38,23 +44,19 @@ async def startup_warmup():
     """
     async def _warm_embeddings():
         try:
-            # Import and call embed_query in an executor to avoid blocking the event loop
             from utils import embedder
             loop = asyncio.get_event_loop()
-            # run small embedding call in threadpool
             await loop.run_in_executor(None, lambda: embedder.get_embeddings().embed_query("warmup"))
-            print("✅ Background: embeddings warmup complete")
+            logging.info("✅ Background: embeddings warmup complete")
         except Exception as e:
-            print(f"⚠️ Background: embeddings warmup failed: {e}")
+            logging.warning(f"⚠️ Background: embeddings warmup failed: {e}")
 
-    # Launch background warmup, but don't await it here
     asyncio.create_task(_warm_embeddings())
 
 
 def get_gemini_model():
     """
     Lazily create / cache the Gemini model inside google.generativeai.
-    We keep logic same as before but avoid doing this at import time.
     """
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
@@ -68,27 +70,35 @@ async def hackrx_run(payload: HackRxRequest, authorization: str = Security(api_k
         raise HTTPException(401, "Invalid or missing API key")
 
     try:
-        # Download document
-        resp = requests.get(payload.documents, timeout=30)
-        resp.raise_for_status()
+        logging.info("Starting document download...")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(payload.documents)
+            resp.raise_for_status()
+            content = resp.content
+        logging.info(f"Document downloaded, size: {len(content)} bytes")
 
-        # Save temp file
         url_path = urlparse(payload.documents).path
         suffix = os.path.splitext(url_path)[1] or ".pdf"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(resp.content)
+            tmp.write(content)
             tmp_path = tmp.name
 
-        # Lazy import processing functions (they handle their own lazy loads)
+        logging.info("Starting chunking document...")
         from utils.loader import load_and_chunk
         from utils.embedder import store_chunks_qdrant, load_qdrant
 
-        # Process and store chunks
         chunks = load_and_chunk(tmp_path)
-        store_chunks_qdrant(chunks)
-        db = load_qdrant()
+        logging.info(f"Chunking done, {len(chunks)} chunks created")
 
-        # Lazy load Gemini model
+        logging.info("Storing chunks in Qdrant...")
+        store_chunks_qdrant(chunks)
+        logging.info("Chunks stored successfully")
+
+        logging.info("Loading Qdrant vectorstore...")
+        db = load_qdrant()
+        logging.info("Qdrant vectorstore loaded")
+
+        logging.info("Generating answers...")
         model = get_gemini_model()
 
         answers = []
@@ -107,16 +117,20 @@ async def hackrx_run(payload: HackRxRequest, authorization: str = Security(api_k
             except Exception as e:
                 answers.append(f"Error generating answer: {str(e)}")
 
+        logging.info("Answers generated, returning response")
         return {"answers": answers}
 
-    except requests.RequestException as e:
+    except httpx.RequestError as e:
+        logging.error(f"Failed to download document: {e}")
         raise HTTPException(400, f"Failed to download document: {str(e)}")
     except Exception as e:
+        logging.error(f"Processing error: {e}")
         raise HTTPException(500, f"Processing error: {str(e)}")
     finally:
         try:
             if "tmp_path" in locals():
                 os.remove(tmp_path)
+                logging.info("Temporary file removed")
         except Exception:
             pass
 
